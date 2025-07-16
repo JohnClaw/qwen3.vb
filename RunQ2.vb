@@ -1,15 +1,16 @@
 ' runq.vb
 ' Конвертация C-кода для инференса модели Qwen-3 на Visual Basic .NET.
+' ИСПРАВЛЕНО: для работы с большими файлами моделей (>2GB)
 Imports System
 Imports System.Collections.Generic
 Imports System.Diagnostics
 Imports System.IO
 Imports System.Linq
-Imports System.Numerics ' <-- ДОБАВЛЕНО ДЛЯ ИСПРАВЛЕНИЯ
+Imports System.Numerics
 Imports System.Text
-Imports System.Runtime.InteropServices ' Для MemoryMarshal, хоть и не используется напрямую, полезно для контекста
-Imports System.Runtime.CompilerServices ' Для Unsafe, если бы использовался, но здесь нет
-Imports System.IO.MemoryMappedFiles ' Added for MemoryMappedFile
+Imports System.Runtime.InteropServices
+Imports System.Runtime.CompilerServices
+Imports System.IO.MemoryMappedFiles
 
 
 ' ----------------------------------------------------------------------------
@@ -74,54 +75,55 @@ Public Class TransformerWeights
 
     Public Property TokenEmbeddingTable As Single()
 
-    Public Sub New(p As Config, memory As Byte())
-        Dim offset As Integer = 0
+    ' --- ИЗМЕНЕНИЕ: Конструктор теперь принимает MemoryMappedViewAccessor и Long смещение ---
+    Public Sub New(p As Config, accessor As MemoryMappedViewAccessor, startOffset As Long)
+        Dim offset As Long = startOffset ' Используем Long для смещения
 
-        ' Использование приватных функций для чтения из массива памяти
-        Me.RmsAttWeight = ReadFloats(memory, offset, p.NumLayers * p.Dimension)
-        Me.RmsFfnWeight = ReadFloats(memory, offset, p.NumLayers * p.Dimension)
-        Me.RmsFinalWeight = ReadFloats(memory, offset, p.Dimension)
-        Me.Q_Ln_Weights = ReadFloats(memory, offset, p.NumLayers * p.HeadDimension)
-        Me.K_Ln_Weights = ReadFloats(memory, offset, p.NumLayers * p.HeadDimension)
+        ' Используем обновленные приватные функции для чтения из accessor'а
+        Me.RmsAttWeight = ReadFloats(accessor, offset, p.NumLayers * p.Dimension)
+        Me.RmsFfnWeight = ReadFloats(accessor, offset, p.NumLayers * p.Dimension)
+        Me.RmsFinalWeight = ReadFloats(accessor, offset, p.Dimension)
+        Me.Q_Ln_Weights = ReadFloats(accessor, offset, p.NumLayers * p.HeadDimension)
+        Me.K_Ln_Weights = ReadFloats(accessor, offset, p.NumLayers * p.HeadDimension)
 
-        Me.Q_Tokens = ReadQuantizedTensors(memory, offset, 1, p.VocabSize * p.Dimension)(0)
-        Me.Wq = ReadQuantizedTensors(memory, offset, p.NumLayers, p.Dimension * (p.NumHeads * p.HeadDimension))
-        Me.Wk = ReadQuantizedTensors(memory, offset, p.NumLayers, p.Dimension * (p.NumKVHeads * p.HeadDimension))
-        Me.Wv = ReadQuantizedTensors(memory, offset, p.NumLayers, p.Dimension * (p.NumKVHeads * p.HeadDimension))
-        Me.Wo = ReadQuantizedTensors(memory, offset, p.NumLayers, (p.NumHeads * p.HeadDimension) * p.Dimension)
-        Me.W1 = ReadQuantizedTensors(memory, offset, p.NumLayers, p.Dimension * p.HiddenDimension)
-        Me.W2 = ReadQuantizedTensors(memory, offset, p.NumLayers, p.HiddenDimension * p.Dimension)
-        Me.W3 = ReadQuantizedTensors(memory, offset, p.NumLayers, p.Dimension * p.HiddenDimension)
+        Me.Q_Tokens = ReadQuantizedTensors(accessor, offset, 1, p.VocabSize * p.Dimension)(0)
+        Me.Wq = ReadQuantizedTensors(accessor, offset, p.NumLayers, p.Dimension * (p.NumHeads * p.HeadDimension))
+        Me.Wk = ReadQuantizedTensors(accessor, offset, p.NumLayers, p.Dimension * (p.NumKVHeads * p.HeadDimension))
+        Me.Wv = ReadQuantizedTensors(accessor, offset, p.NumLayers, p.Dimension * (p.NumKVHeads * p.HeadDimension))
+        Me.Wo = ReadQuantizedTensors(accessor, offset, p.NumLayers, (p.NumHeads * p.HeadDimension) * p.Dimension)
+        Me.W1 = ReadQuantizedTensors(accessor, offset, p.NumLayers, p.Dimension * p.HiddenDimension)
+        Me.W2 = ReadQuantizedTensors(accessor, offset, p.NumLayers, p.HiddenDimension * p.Dimension)
+        Me.W3 = ReadQuantizedTensors(accessor, offset, p.NumLayers, p.Dimension * p.HiddenDimension)
 
         If p.IsSharedClassifier Then
             Me.Wcls = Me.Q_Tokens
         Else
-            Me.Wcls = ReadQuantizedTensors(memory, offset, 1, p.Dimension * p.VocabSize)(0)
+            Me.Wcls = ReadQuantizedTensors(accessor, offset, 1, p.Dimension * p.VocabSize)(0)
         End If
 
         Me.TokenEmbeddingTable = New Single(p.VocabSize * p.Dimension - 1) {}
         Dequantize(Me.Q_Tokens, Me.TokenEmbeddingTable)
     End Sub
 
-    ' Вспомогательные методы для чтения из байтового массива
-    Private Function ReadFloats(memory As Byte(), ByRef offset As Integer, count As Integer) As Single()
+    ' --- ИЗМЕНЕНИЕ: Вспомогательные методы теперь читают из MemoryMappedViewAccessor ---
+    Private Function ReadFloats(accessor As MemoryMappedViewAccessor, ByRef offset As Long, count As Integer) As Single()
         Dim result(count - 1) As Single
-        Buffer.BlockCopy(memory, offset, result, 0, count * 4)
-        offset += count * 4
+        accessor.ReadArray(Of Single)(offset, result, 0, count)
+        offset += CLng(count) * 4
         Return result
     End Function
 
-    Private Function ReadQuantizedTensors(memory As Byte(), ByRef offset As Integer, numTensors As Integer, tensorSize As Integer) As QuantizedTensor()
+    Private Function ReadQuantizedTensors(accessor As MemoryMappedViewAccessor, ByRef offset As Long, numTensors As Integer, tensorSize As Integer) As QuantizedTensor()
         Dim tensors(numTensors - 1) As QuantizedTensor
         For i As Integer = 0 To numTensors - 1
             Dim qArray(tensorSize - 1) As SByte
-            Buffer.BlockCopy(memory, offset, qArray, 0, tensorSize)
+            accessor.ReadArray(Of SByte)(offset, qArray, 0, tensorSize)
             offset += tensorSize
 
             Dim scalesSize As Integer = If(Globals.GS > 0, tensorSize \ Globals.GS, 0)
             Dim sArray(scalesSize - 1) As Single
-            Buffer.BlockCopy(memory, offset, sArray, 0, scalesSize * 4)
-            offset += scalesSize * 4
+            accessor.ReadArray(Of Single)(offset, sArray, 0, scalesSize)
+            offset += CLng(scalesSize) * 4
 
             tensors(i) = New QuantizedTensor(qArray, sArray)
         Next
@@ -191,60 +193,65 @@ Public Class Transformer
     Public Property Config As Config
     Private ReadOnly Weights As TransformerWeights
     Private ReadOnly State As RunState
+    
+    ' --- ИЗМЕНЕНИЕ: Добавлены поля для управления файлом, отображенным в память ---
     Private _mmf As MemoryMappedFile
+    Private _accessor As MemoryMappedViewAccessor
 
+    ' --- ИЗМЕНЕНИЕ: Конструктор теперь не загружает весь файл в память ---
     Public Sub New(checkpointPath As String, ctxLength As Integer)
         If Not File.Exists(checkpointPath) Then
             Throw New FileNotFoundException("Checkpoint file not found.", checkpointPath)
         End If
 
         _mmf = MemoryMappedFile.CreateFromFile(checkpointPath, FileMode.Open, Nothing, 0, MemoryMappedFileAccess.Read)
-        Using accessor = _mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read)
-            ' Read the full 256-byte header
-            Dim headerBytes(255) As Byte
-            accessor.ReadArray(Of Byte)(0, headerBytes, 0, 256)
+        _accessor = _mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read)
 
-            ' Reconstruct Config manually from headerBytes
-            Me.Config = New Config With {
-                .MagicNumber = BitConverter.ToUInt32(headerBytes, 0),
-                .Version = BitConverter.ToInt32(headerBytes, 4),
-                .Dimension = BitConverter.ToInt32(headerBytes, 8),
-                .HiddenDimension = BitConverter.ToInt32(headerBytes, 12),
-                .NumLayers = BitConverter.ToInt32(headerBytes, 16),
-                .NumHeads = BitConverter.ToInt32(headerBytes, 20),
-                .NumKVHeads = BitConverter.ToInt32(headerBytes, 24),
-                .VocabSize = BitConverter.ToInt32(headerBytes, 28),
-                .SeqLength = BitConverter.ToInt32(headerBytes, 32),
-                .HeadDimension = BitConverter.ToInt32(headerBytes, 36),
-                .SharedClassifier = BitConverter.ToInt32(headerBytes, 40),
-                .GroupSize = BitConverter.ToInt32(headerBytes, 44)
-            }
+        ' Read the full 256-byte header
+        Dim headerBytes(255) As Byte
+        _accessor.ReadArray(Of Byte)(0, headerBytes, 0, 256)
 
-            If Me.Config.MagicNumber <> &H616A6331 Then
-                Throw New InvalidDataException($"File {checkpointPath} is not a qwen3.c checkpoint")
-            End If
-            If Me.Config.Version <> 1 Then
-                Throw New InvalidDataException($"Checkpoint {checkpointPath} is version {Me.Config.Version}, expected 1")
-            End If
+        ' Reconstruct Config manually from headerBytes
+        Me.Config = New Config With {
+            .MagicNumber = BitConverter.ToUInt32(headerBytes, 0),
+            .Version = BitConverter.ToInt32(headerBytes, 4),
+            .Dimension = BitConverter.ToInt32(headerBytes, 8),
+            .HiddenDimension = BitConverter.ToInt32(headerBytes, 12),
+            .NumLayers = BitConverter.ToInt32(headerBytes, 16),
+            .NumHeads = BitConverter.ToInt32(headerBytes, 20),
+            .NumKVHeads = BitConverter.ToInt32(headerBytes, 24),
+            .VocabSize = BitConverter.ToInt32(headerBytes, 28),
+            .SeqLength = BitConverter.ToInt32(headerBytes, 32),
+            .HeadDimension = BitConverter.ToInt32(headerBytes, 36),
+            .SharedClassifier = BitConverter.ToInt32(headerBytes, 40),
+            .GroupSize = BitConverter.ToInt32(headerBytes, 44)
+        }
 
-            If ctxLength > 0 AndAlso ctxLength <= Me.Config.SeqLength Then
-                Me.Config.SeqLength = ctxLength
-            End If
+        If Me.Config.MagicNumber <> &H616A6331 Then
+            Throw New InvalidDataException($"File {checkpointPath} is not a qwen3.c checkpoint")
+        End If
+        If Me.Config.Version <> 1 Then
+            Throw New InvalidDataException($"Checkpoint {checkpointPath} is version {Me.Config.Version}, expected 1")
+        End If
 
-            Globals.GS = Me.Config.GroupSize
+        If ctxLength > 0 AndAlso ctxLength <= Me.Config.SeqLength Then
+            Me.Config.SeqLength = ctxLength
+        End If
 
-            ' Чтение весов из MemoryMappedFile в байтовый массив
-            Dim weightsMemorySize As Integer = CInt(accessor.Capacity - 256) ' 256 bytes for header
-            Dim weightsMemoryBytes(weightsMemorySize - 1) As Byte
-            accessor.ReadArray(Of Byte)(256, weightsMemoryBytes, 0, weightsMemorySize)
+        Globals.GS = Me.Config.GroupSize
 
-            Me.Weights = New TransformerWeights(Me.Config, weightsMemoryBytes)
-        End Using
+        ' --- ГЛАВНОЕ ИЗМЕНЕНИЕ: Убираем загрузку всего файла в массив.
+        ' Вместо этого передаем accessor и начальное смещение (256 байт заголовка)
+        ' в конструктор весов. Ошибка Overflow возникала здесь.
+        Me.Weights = New TransformerWeights(Me.Config, _accessor, 256L)
 
         Me.State = New RunState(Me.Config)
     End Sub
 
+    ' --- ИЗМЕНЕНИЕ: Корректное освобождение ресурсов ---
     Public Sub Dispose() Implements IDisposable.Dispose
+        _accessor?.Dispose()
+        _accessor = Nothing
         _mmf?.Dispose()
         _mmf = Nothing
         GC.SuppressFinalize(Me)
